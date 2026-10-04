@@ -12,6 +12,7 @@ import io.kestra.core.serializers.FileSerde;
 import io.kestra.plugin.huawei.dms.kafka.models.Message;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
+import lombok.AccessLevel;
 import lombok.Builder;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
@@ -21,6 +22,7 @@ import lombok.experimental.SuperBuilder;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.header.Header;
 
 import java.io.BufferedOutputStream;
@@ -34,6 +36,9 @@ import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @SuperBuilder
 @ToString
@@ -119,6 +124,18 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
     @PluginProperty(group = "execution")
     private Property<Duration> pollDuration = Property.ofValue(Duration.ofSeconds(5));
 
+    @Builder.Default
+    @Getter(AccessLevel.NONE)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    private final AtomicBoolean isActive = new AtomicBoolean(true);
+
+    @Builder.Default
+    @Getter(AccessLevel.NONE)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    private final AtomicReference<KafkaConsumer<byte[], byte[]>> consumerRef = new AtomicReference<>();
+
     @Override
     public Output run(RunContext runContext) throws Exception {
         if (maxRecords == null && maxDuration == null) {
@@ -140,24 +157,42 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
             var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE);
             var consumer = consumer(runContext, rGroupId)
         ) {
+            consumerRef.set(consumer);
             consumer.subscribe(List.of(rTopic));
             var started = ZonedDateTime.now();
 
-            boolean finished;
-            do {
-                var records = consumer.poll(rPollDuration);
-                for (var record : records) {
-                    FileSerde.write(output, toMessage(record, rKeySerdeType, rValueSerdeType));
-                    total++;
+            boolean finished = false;
+            try {
+                do {
+                    if (!this.isActive.get()) {
+                        break;
+                    }
+                    var records = consumer.poll(rPollDuration);
+                    for (var record : records) {
+                        FileSerde.write(output, toMessage(record, rKeySerdeType, rValueSerdeType));
+                        total++;
+                        if (!this.isActive.get()) {
+                            break;
+                        }
+                    }
+                    finished = isFinished(rMaxRecords, rMaxDuration, total, started) || !this.isActive.get();
+                    if (!finished && records.isEmpty()) {
+                        finished = isDrained(consumer);
+                    }
+                } while (!finished && this.isActive.get());
+            } catch (WakeupException e) {
+                if (this.isActive.get()) {
+                    throw e;
                 }
-                finished = isFinished(rMaxRecords, rMaxDuration, total, started);
-                if (!finished && records.isEmpty()) {
-                    finished = isDrained(consumer);
-                }
-            } while (!finished);
+                runContext.logger().info("Kafka consumer was woken up to stop/kill task.");
+            } finally {
+                consumerRef.set(null);
+            }
 
             output.flush();
-            consumer.commitSync();
+            if (this.isActive.get()) {
+                consumer.commitSync();
+            }
         }
 
         runContext.metric(Counter.of("dms.kafka.consume.count", total));
@@ -167,6 +202,17 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
             .messagesCount(total)
             .uri(runContext.storage().putFile(tempFile))
             .build();
+    }
+
+    @Override
+    public void kill() {
+        stop();
+    }
+
+    @Override
+    public void stop() {
+        this.isActive.set(false);
+        Optional.ofNullable(consumerRef.get()).ifPresent(KafkaConsumer::wakeup);
     }
 
     private boolean isFinished(Integer rMax, Duration rDuration, int count, ZonedDateTime start) {

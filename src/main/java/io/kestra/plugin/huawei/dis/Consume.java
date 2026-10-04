@@ -13,6 +13,7 @@ import io.kestra.core.serializers.FileSerde;
 import io.kestra.plugin.huawei.dis.models.Record;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
+import lombok.AccessLevel;
 import lombok.Builder;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
@@ -30,6 +31,7 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @SuperBuilder
 @ToString
@@ -119,6 +121,12 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
     @PluginProperty(group = "execution")
     private Property<Integer> maxFetchBytes = Property.ofValue(MAX_FETCH_BYTES_HARD_CAP);
 
+    @Builder.Default
+    @Getter(AccessLevel.NONE)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    private final AtomicBoolean isActive = new AtomicBoolean(true);
+
     @Override
     public Output run(RunContext runContext) throws Exception {
         if (maxRecords == null && maxDuration == null) {
@@ -149,7 +157,7 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
         var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
         PollResult result;
         try (var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE)) {
-            result = poll(runContext, client, rStreamName, partitionIds, null, config, output);
+            result = poll(runContext, client, rStreamName, partitionIds, null, config, output, this.isActive);
             output.flush();
         }
 
@@ -160,6 +168,16 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
             .count(result.count())
             .uri(runContext.storage().putFile(tempFile))
             .build();
+    }
+
+    @Override
+    public void kill() {
+        stop();
+    }
+
+    @Override
+    public void stop() {
+        this.isActive.set(false);
     }
 
     /** Shared by {@code Consume}, {@code Trigger}, and {@code RealtimeTrigger} so the same bound applies everywhere. Returns {@code -1} when unset (no limit). */
@@ -206,6 +224,13 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
         RunContext runContext, DisClient client, String rStreamName, List<String> partitionIds,
         Map<String, String> resumeFrom, PollConfig config, OutputStream out
     ) throws Exception {
+        return poll(runContext, client, rStreamName, partitionIds, resumeFrom, config, out, new AtomicBoolean(true));
+    }
+
+    static PollResult poll(
+        RunContext runContext, DisClient client, String rStreamName, List<String> partitionIds,
+        Map<String, String> resumeFrom, PollConfig config, OutputStream out, AtomicBoolean isActive
+    ) throws Exception {
         var logger = runContext.logger();
         var cursors = new LinkedHashMap<String, String>();
         var lastSequenceNumbers = new LinkedHashMap<String, String>();
@@ -222,9 +247,12 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
         var started = Instant.now();
         var finished = false;
 
-        while (!finished) {
+        while (!finished && (isActive == null || isActive.get())) {
             var roundRecords = 0;
             for (var pid : partitionIds) {
+                if (isActive != null && !isActive.get()) {
+                    break;
+                }
                 var cursor = cursors.get(pid);
                 if (cursor == null) {
                     continue;
@@ -255,7 +283,8 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
 
             finished = (config.maxRecords() >= 0 && total >= config.maxRecords())
                 || (config.maxDuration() != null && Instant.now().isAfter(started.plus(config.maxDuration())))
-                || roundRecords == 0;
+                || roundRecords == 0
+                || (isActive != null && !isActive.get());
         }
 
         return new PollResult(total, lastSequenceNumbers);

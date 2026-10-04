@@ -12,6 +12,7 @@ import io.kestra.core.serializers.FileSerde;
 import io.kestra.plugin.huawei.dms.rocketmq.models.Message;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
+import lombok.AccessLevel;
 import lombok.Builder;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
@@ -28,6 +29,7 @@ import java.net.URI;
 import java.time.Duration;
 import java.time.ZonedDateTime;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @SuperBuilder
 @ToString
@@ -82,6 +84,12 @@ public class Consume extends AbstractDmsRocketMq implements RunnableTask<Consume
     @PluginProperty(group = "execution")
     private Property<Duration> maxDuration;
 
+    @Builder.Default
+    @Getter(AccessLevel.NONE)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    private final AtomicBoolean isActive = new AtomicBoolean(true);
+
     @Override
     public Output run(RunContext runContext) throws Exception {
         if (maxRecords == null && maxDuration == null) {
@@ -104,12 +112,15 @@ public class Consume extends AbstractDmsRocketMq implements RunnableTask<Consume
 
             outer:
             for (var mq : mqs) {
+                if (!this.isActive.get()) {
+                    break;
+                }
                 var offset = consumer.fetchConsumeOffset(mq, false);
                 if (offset < 0) {
                     offset = 0;
                 }
 
-                while (true) {
+                while (this.isActive.get()) {
                     var pullResult = consumer.pull(mq, rTags, offset, 32);
                     if (pullResult.getPullStatus() == PullStatus.FOUND) {
                         for (var msg : pullResult.getMsgFoundList()) {
@@ -123,7 +134,7 @@ public class Consume extends AbstractDmsRocketMq implements RunnableTask<Consume
                                 .bornTimestamp(msg.getBornTimestamp())
                                 .build());
                             total++;
-                            if (isFinished(runContext, total, started)) {
+                            if (isFinished(runContext, total, started) || !this.isActive.get()) {
                                 consumer.updateConsumeOffset(mq, pullResult.getNextBeginOffset());
                                 break outer;
                             }
@@ -137,7 +148,7 @@ public class Consume extends AbstractDmsRocketMq implements RunnableTask<Consume
                         break;
                     }
 
-                    if (isFinished(runContext, total, started)) {
+                    if (isFinished(runContext, total, started) || !this.isActive.get()) {
                         break outer;
                     }
                 }
@@ -154,6 +165,16 @@ public class Consume extends AbstractDmsRocketMq implements RunnableTask<Consume
             .messagesCount(total)
             .uri(runContext.storage().putFile(tempFile))
             .build();
+    }
+
+    @Override
+    public void kill() {
+        stop();
+    }
+
+    @Override
+    public void stop() {
+        this.isActive.set(false);
     }
 
     private boolean isFinished(RunContext runContext, int count, ZonedDateTime start) throws Exception {

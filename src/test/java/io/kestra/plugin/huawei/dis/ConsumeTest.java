@@ -285,6 +285,39 @@ class ConsumeTest {
         assertThrows(IllegalArgumentException.class, () -> task.run(runContext));
     }
 
+    @Test
+    void run_stoppedOrKilled_haltsConsumptionEarly() throws Exception {
+        stubSinglePartitionStream();
+        stubCursor();
+
+        var data = Base64.getEncoder().encodeToString("x".getBytes(StandardCharsets.UTF_8));
+        wireMock.stubFor(get(urlMatching(".*/records.*"))
+            .willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                    {"records": [
+                        {"partition_key": "pk-1", "sequence_number": "seq-1", "data": "%s", "timestamp": 1000},
+                        {"partition_key": "pk-1", "sequence_number": "seq-2", "data": "%s", "timestamp": 2000},
+                        {"partition_key": "pk-1", "sequence_number": "seq-3", "data": "%s", "timestamp": 3000}
+                    ], "next_partition_cursor": "cursor-2"}
+                    """.formatted(data, data, data))));
+
+        var runContext = runContextFactory.of(Collections.emptyMap());
+        var task = baseTask().maxRecords(Property.ofValue(100)).build();
+        task.stop();
+
+        var output = task.run(runContext);
+
+        assertThat(output.getCount(), equalTo(0));
+
+        var taskToKill = baseTask().maxRecords(Property.ofValue(100)).build();
+        taskToKill.kill();
+
+        var killOutput = taskToKill.run(runContext);
+        assertThat(killOutput.getCount(), equalTo(0));
+    }
+
     private List<Record> readRecords(RunContext runContext, URI uri) throws Exception {
         try (var reader = new InputStreamReader(runContext.storage().getFile(uri), StandardCharsets.UTF_8)) {
             return FileSerde.readAll(reader, Record.class).collectList().block();
