@@ -21,6 +21,7 @@ import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.header.Header;
@@ -34,6 +35,7 @@ import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.util.AbstractMap;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -160,6 +162,7 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
 
         var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
         var total = 0;
+        Map<TopicPartition, OffsetAndMetadata> lastOffsets = new HashMap<>();
 
         try (
             var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE);
@@ -179,6 +182,7 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
                     for (var record : records) {
                         FileSerde.write(output, toMessage(record, rKeySerdeType, rValueSerdeType));
                         total++;
+                        lastOffsets.put(new TopicPartition(record.topic(), record.partition()), new OffsetAndMetadata(record.offset() + 1));
                         if (!this.isActive.get()) {
                             break;
                         }
@@ -198,8 +202,8 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
             }
 
             output.flush();
-            if (!this.isKilled.get()) {
-                consumer.commitSync();
+            if (!this.isKilled.get() && !lastOffsets.isEmpty()) {
+                commitOffsets(consumer, lastOffsets, runContext);
             }
         }
 
@@ -210,6 +214,16 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
             .messagesCount(total)
             .uri(runContext.storage().putFile(tempFile))
             .build();
+    }
+
+    private void commitOffsets(KafkaConsumer<byte[], byte[]> consumer, Map<TopicPartition, OffsetAndMetadata> offsets, RunContext runContext) {
+        try {
+            consumer.commitSync(offsets);
+        } catch (WakeupException e) {
+            // A pending wakeup flag thrown by the first blocking call is consumed; retry once to complete the commit.
+            runContext.logger().debug("WakeupException caught during commitSync, retrying commit.");
+            consumer.commitSync(offsets);
+        }
     }
 
     @Override
