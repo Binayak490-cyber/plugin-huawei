@@ -146,74 +146,77 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
 
     @Override
     public Output run(RunContext runContext) throws Exception {
-        this.isActive.set(true);
-        this.isKilled.set(false);
-        if (maxRecords == null && maxDuration == null) {
-            throw new IllegalArgumentException("'maxRecords' or 'maxDuration' must be set to avoid an infinite loop");
-        }
+        try {
+            if (maxRecords == null && maxDuration == null) {
+                throw new IllegalArgumentException("'maxRecords' or 'maxDuration' must be set to avoid an infinite loop");
+            }
 
-        var rTopic = runContext.render(topic).as(String.class).orElseThrow();
-        var rGroupId = runContext.render(groupId).as(String.class).orElseThrow();
-        var rKeySerdeType = runContext.render(keySerdeType).as(SerdeType.class).orElse(SerdeType.STRING);
-        var rValueSerdeType = runContext.render(valueSerdeType).as(SerdeType.class).orElse(SerdeType.STRING);
-        var rPollDuration = runContext.render(pollDuration).as(Duration.class).orElse(Duration.ofSeconds(5));
-        var rMaxRecords = runContext.render(maxRecords).as(Integer.class).orElse(null);
-        var rMaxDuration = runContext.render(maxDuration).as(Duration.class).orElse(null);
+            var rTopic = runContext.render(topic).as(String.class).orElseThrow();
+            var rGroupId = runContext.render(groupId).as(String.class).orElseThrow();
+            var rKeySerdeType = runContext.render(keySerdeType).as(SerdeType.class).orElse(SerdeType.STRING);
+            var rValueSerdeType = runContext.render(valueSerdeType).as(SerdeType.class).orElse(SerdeType.STRING);
+            var rPollDuration = runContext.render(pollDuration).as(Duration.class).orElse(Duration.ofSeconds(5));
+            var rMaxRecords = runContext.render(maxRecords).as(Integer.class).orElse(null);
+            var rMaxDuration = runContext.render(maxDuration).as(Duration.class).orElse(null);
 
-        var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
-        var total = 0;
-        Map<TopicPartition, OffsetAndMetadata> lastOffsets = new HashMap<>();
+            var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
+            var total = 0;
+            Map<TopicPartition, OffsetAndMetadata> lastOffsets = new HashMap<>();
 
-        try (
-            var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE);
-            var consumer = consumer(runContext, rGroupId)
-        ) {
-            consumerRef.set(consumer);
-            consumer.subscribe(List.of(rTopic));
-            var started = ZonedDateTime.now();
+            try (
+                var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE);
+                var consumer = consumer(runContext, rGroupId)
+            ) {
+                consumerRef.set(consumer);
+                consumer.subscribe(List.of(rTopic));
+                var started = ZonedDateTime.now();
 
-            boolean finished = false;
-            try {
-                do {
-                    if (!this.isActive.get()) {
-                        break;
-                    }
-                    var records = consumer.poll(rPollDuration);
-                    for (var record : records) {
-                        FileSerde.write(output, toMessage(record, rKeySerdeType, rValueSerdeType));
-                        total++;
-                        lastOffsets.put(new TopicPartition(record.topic(), record.partition()), new OffsetAndMetadata(record.offset() + 1));
+                boolean finished = false;
+                try {
+                    do {
                         if (!this.isActive.get()) {
                             break;
                         }
+                        var records = consumer.poll(rPollDuration);
+                        for (var record : records) {
+                            FileSerde.write(output, toMessage(record, rKeySerdeType, rValueSerdeType));
+                            total++;
+                            lastOffsets.put(new TopicPartition(record.topic(), record.partition()), new OffsetAndMetadata(record.offset() + 1));
+                            if (!this.isActive.get()) {
+                                break;
+                            }
+                        }
+                        finished = isFinished(rMaxRecords, rMaxDuration, total, started) || !this.isActive.get();
+                        if (!finished && records.isEmpty()) {
+                            finished = isDrained(consumer);
+                        }
+                    } while (!finished && this.isActive.get());
+                } catch (WakeupException e) {
+                    if (this.isActive.get()) {
+                        throw e;
                     }
-                    finished = isFinished(rMaxRecords, rMaxDuration, total, started) || !this.isActive.get();
-                    if (!finished && records.isEmpty()) {
-                        finished = isDrained(consumer);
-                    }
-                } while (!finished && this.isActive.get());
-            } catch (WakeupException e) {
-                if (this.isActive.get()) {
-                    throw e;
+                    runContext.logger().info("Kafka consumer was woken up to stop/kill task.");
+                } finally {
+                    consumerRef.set(null);
                 }
-                runContext.logger().info("Kafka consumer was woken up to stop/kill task.");
-            } finally {
-                consumerRef.set(null);
+
+                output.flush();
+                if (!this.isKilled.get() && !lastOffsets.isEmpty()) {
+                    commitOffsets(consumer, lastOffsets, runContext);
+                }
             }
 
-            output.flush();
-            if (!this.isKilled.get() && !lastOffsets.isEmpty()) {
-                commitOffsets(consumer, lastOffsets, runContext);
-            }
+            runContext.metric(Counter.of("dms.kafka.consume.count", total));
+            runContext.logger().debug("Consumed {} records from DMS Kafka topic {}", total, rTopic);
+
+            return Output.builder()
+                .messagesCount(total)
+                .uri(runContext.storage().putFile(tempFile))
+                .build();
+        } finally {
+            this.isActive.set(true);
+            this.isKilled.set(false);
         }
-
-        runContext.metric(Counter.of("dms.kafka.consume.count", total));
-        runContext.logger().debug("Consumed {} records from DMS Kafka topic {}", total, rTopic);
-
-        return Output.builder()
-            .messagesCount(total)
-            .uri(runContext.storage().putFile(tempFile))
-            .build();
     }
 
     private void commitOffsets(KafkaConsumer<byte[], byte[]> consumer, Map<TopicPartition, OffsetAndMetadata> offsets, RunContext runContext) {

@@ -129,46 +129,49 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
 
     @Override
     public Output run(RunContext runContext) throws Exception {
-        this.isActive.set(true);
-        if (maxRecords == null && maxDuration == null) {
-            throw new IllegalArgumentException("'maxRecords' or 'maxDuration' must be set to avoid an infinite loop");
+        try {
+            if (maxRecords == null && maxDuration == null) {
+                throw new IllegalArgumentException("'maxRecords' or 'maxDuration' must be set to avoid an infinite loop");
+            }
+
+            var rStreamName = runContext.render(streamName).as(String.class)
+                .orElseThrow(() -> new IllegalArgumentException("'streamName' is required"));
+            var rPartitionId = runContext.render(partitionId).as(String.class).orElse(null);
+            var rStartingPosition = runContext.render(startingPosition).as(StartingPosition.class).orElse(StartingPosition.TRIM_HORIZON);
+            var rStartingTimestamp = runContext.render(startingTimestamp).as(Instant.class).orElse(null);
+            var rSerdeType = runContext.render(serdeType).as(SerdeType.class).orElse(SerdeType.STRING);
+            var rMaxRecords = requireBoundedMaxRecords(runContext.render(maxRecords).as(Integer.class).orElse(null));
+            var rMaxDuration = requireBoundedMaxDuration(runContext.render(maxDuration).as(Duration.class).orElse(null));
+            var rMaxFetchBytes = requireBoundedMaxFetchBytes(runContext.render(maxFetchBytes).as(Integer.class).orElse(null));
+
+            if (rStartingPosition == StartingPosition.AT_TIMESTAMP && rStartingTimestamp == null) {
+                throw new IllegalArgumentException("'startingTimestamp' is required when 'startingPosition' is AT_TIMESTAMP");
+            }
+
+            var client = client(runContext);
+            var partitionIds = rPartitionId != null && !rPartitionId.isBlank()
+                ? List.of(rPartitionId)
+                : DisService.listPartitionIds(client, rStreamName);
+
+            var config = new PollConfig(rStartingPosition, rStartingTimestamp, rSerdeType, rMaxRecords, rMaxDuration, rMaxFetchBytes);
+
+            var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
+            PollResult result;
+            try (var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE)) {
+                result = poll(runContext, client, rStreamName, partitionIds, null, config, output, this.isActive);
+                output.flush();
+            }
+
+            runContext.metric(Counter.of("dis.consume.count", result.count()));
+            runContext.logger().debug("Consumed {} records from DIS stream {}", result.count(), rStreamName);
+
+            return Output.builder()
+                .count(result.count())
+                .uri(runContext.storage().putFile(tempFile))
+                .build();
+        } finally {
+            this.isActive.set(true);
         }
-
-        var rStreamName = runContext.render(streamName).as(String.class)
-            .orElseThrow(() -> new IllegalArgumentException("'streamName' is required"));
-        var rPartitionId = runContext.render(partitionId).as(String.class).orElse(null);
-        var rStartingPosition = runContext.render(startingPosition).as(StartingPosition.class).orElse(StartingPosition.TRIM_HORIZON);
-        var rStartingTimestamp = runContext.render(startingTimestamp).as(Instant.class).orElse(null);
-        var rSerdeType = runContext.render(serdeType).as(SerdeType.class).orElse(SerdeType.STRING);
-        var rMaxRecords = requireBoundedMaxRecords(runContext.render(maxRecords).as(Integer.class).orElse(null));
-        var rMaxDuration = requireBoundedMaxDuration(runContext.render(maxDuration).as(Duration.class).orElse(null));
-        var rMaxFetchBytes = requireBoundedMaxFetchBytes(runContext.render(maxFetchBytes).as(Integer.class).orElse(null));
-
-        if (rStartingPosition == StartingPosition.AT_TIMESTAMP && rStartingTimestamp == null) {
-            throw new IllegalArgumentException("'startingTimestamp' is required when 'startingPosition' is AT_TIMESTAMP");
-        }
-
-        var client = client(runContext);
-        var partitionIds = rPartitionId != null && !rPartitionId.isBlank()
-            ? List.of(rPartitionId)
-            : DisService.listPartitionIds(client, rStreamName);
-
-        var config = new PollConfig(rStartingPosition, rStartingTimestamp, rSerdeType, rMaxRecords, rMaxDuration, rMaxFetchBytes);
-
-        var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
-        PollResult result;
-        try (var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE)) {
-            result = poll(runContext, client, rStreamName, partitionIds, null, config, output, this.isActive);
-            output.flush();
-        }
-
-        runContext.metric(Counter.of("dis.consume.count", result.count()));
-        runContext.logger().debug("Consumed {} records from DIS stream {}", result.count(), rStreamName);
-
-        return Output.builder()
-            .count(result.count())
-            .uri(runContext.storage().putFile(tempFile))
-            .build();
     }
 
     @Override

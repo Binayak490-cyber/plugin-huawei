@@ -24,6 +24,10 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
@@ -31,6 +35,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlMatching;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.lessThan;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @KestraTest
@@ -165,7 +170,7 @@ class ConsumeTest {
         var result = Consume.poll(
             runContext, client, "my-stream", List.of("0", "1"), null,
             new Consume.PollConfig(StartingPosition.TRIM_HORIZON, null, SerdeType.STRING, 100, null, Consume.MAX_FETCH_BYTES_HARD_CAP),
-            out, new java.util.concurrent.atomic.AtomicBoolean(true)
+            out, new AtomicBoolean(true)
         );
 
         assertThat(result.count(), equalTo(3));
@@ -286,16 +291,22 @@ class ConsumeTest {
     }
 
     @Test
-    void run_stoppedOrKilled_haltsConsumptionEarly() throws Exception {
+    void run_stopped_haltsConsumptionEarly() throws Exception {
         stubSinglePartitionStream();
         stubCursor();
+
+        var firstRequestReceived = new CountDownLatch(1);
+        wireMock.addMockServiceRequestListener((request, response) -> {
+            if (request.getUrl().contains("/records")) {
+                firstRequestReceived.countDown();
+            }
+        });
 
         var data = Base64.getEncoder().encodeToString("x".getBytes(StandardCharsets.UTF_8));
         wireMock.stubFor(get(urlMatching(".*/records.*"))
             .willReturn(aResponse()
                 .withStatus(200)
                 .withHeader("Content-Type", "application/json")
-                .withFixedDelay(100)
                 .withBody("""
                     {"records": [
                         {"partition_key": "pk-1", "sequence_number": "seq-1", "data": "%s", "timestamp": 1000},
@@ -306,13 +317,65 @@ class ConsumeTest {
         var runContext = runContextFactory.of(Collections.emptyMap());
         var task = baseTask().maxRecords(Property.ofValue(1000)).build();
 
-        var executor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
-        executor.schedule(task::stop, 50, java.util.concurrent.TimeUnit.MILLISECONDS);
+        var executor = Executors.newSingleThreadScheduledExecutor();
+        executor.submit(() -> {
+            try {
+                if (firstRequestReceived.await(5, TimeUnit.SECONDS)) {
+                    task.stop();
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        });
 
         var output = task.run(runContext);
         executor.shutdown();
 
-        assertThat(output.getCount(), org.hamcrest.Matchers.lessThan(1000));
+        assertThat(output.getCount(), lessThan(1000));
+    }
+
+    @Test
+    void run_killed_haltsConsumptionEarly() throws Exception {
+        stubSinglePartitionStream();
+        stubCursor();
+
+        var firstRequestReceived = new CountDownLatch(1);
+        wireMock.addMockServiceRequestListener((request, response) -> {
+            if (request.getUrl().contains("/records")) {
+                firstRequestReceived.countDown();
+            }
+        });
+
+        var data = Base64.getEncoder().encodeToString("x".getBytes(StandardCharsets.UTF_8));
+        wireMock.stubFor(get(urlMatching(".*/records.*"))
+            .willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                    {"records": [
+                        {"partition_key": "pk-1", "sequence_number": "seq-1", "data": "%s", "timestamp": 1000},
+                        {"partition_key": "pk-1", "sequence_number": "seq-2", "data": "%s", "timestamp": 2000}
+                    ], "next_partition_cursor": "cursor-2"}
+                    """.formatted(data, data))));
+
+        var runContext = runContextFactory.of(Collections.emptyMap());
+        var task = baseTask().maxRecords(Property.ofValue(1000)).build();
+
+        var executor = Executors.newSingleThreadScheduledExecutor();
+        executor.submit(() -> {
+            try {
+                if (firstRequestReceived.await(5, TimeUnit.SECONDS)) {
+                    task.kill();
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        var output = task.run(runContext);
+        executor.shutdown();
+
+        assertThat(output.getCount(), lessThan(1000));
     }
 
     private List<Record> readRecords(RunContext runContext, URI uri) throws Exception {
