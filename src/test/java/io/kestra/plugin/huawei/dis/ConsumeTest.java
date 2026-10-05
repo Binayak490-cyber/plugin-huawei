@@ -165,7 +165,7 @@ class ConsumeTest {
         var result = Consume.poll(
             runContext, client, "my-stream", List.of("0", "1"), null,
             new Consume.PollConfig(StartingPosition.TRIM_HORIZON, null, SerdeType.STRING, 100, null, Consume.MAX_FETCH_BYTES_HARD_CAP),
-            out
+            out, new java.util.concurrent.atomic.AtomicBoolean(true)
         );
 
         assertThat(result.count(), equalTo(3));
@@ -295,27 +295,24 @@ class ConsumeTest {
             .willReturn(aResponse()
                 .withStatus(200)
                 .withHeader("Content-Type", "application/json")
+                .withFixedDelay(100)
                 .withBody("""
                     {"records": [
                         {"partition_key": "pk-1", "sequence_number": "seq-1", "data": "%s", "timestamp": 1000},
-                        {"partition_key": "pk-1", "sequence_number": "seq-2", "data": "%s", "timestamp": 2000},
-                        {"partition_key": "pk-1", "sequence_number": "seq-3", "data": "%s", "timestamp": 3000}
+                        {"partition_key": "pk-1", "sequence_number": "seq-2", "data": "%s", "timestamp": 2000}
                     ], "next_partition_cursor": "cursor-2"}
-                    """.formatted(data, data, data))));
+                    """.formatted(data, data))));
 
         var runContext = runContextFactory.of(Collections.emptyMap());
-        var task = baseTask().maxRecords(Property.ofValue(100)).build();
-        task.stop();
+        var task = baseTask().maxRecords(Property.ofValue(1000)).build();
+
+        var executor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
+        executor.schedule(task::stop, 50, java.util.concurrent.TimeUnit.MILLISECONDS);
 
         var output = task.run(runContext);
+        executor.shutdown();
 
-        assertThat(output.getCount(), equalTo(0));
-
-        var taskToKill = baseTask().maxRecords(Property.ofValue(100)).build();
-        taskToKill.kill();
-
-        var killOutput = taskToKill.run(runContext);
-        assertThat(killOutput.getCount(), equalTo(0));
+        assertThat(output.getCount(), org.hamcrest.Matchers.lessThan(1000));
     }
 
     private List<Record> readRecords(RunContext runContext, URI uri) throws Exception {

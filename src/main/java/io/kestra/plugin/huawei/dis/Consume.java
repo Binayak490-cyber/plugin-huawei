@@ -129,6 +129,7 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
 
     @Override
     public Output run(RunContext runContext) throws Exception {
+        this.isActive.set(true);
         if (maxRecords == null && maxDuration == null) {
             throw new IllegalArgumentException("'maxRecords' or 'maxDuration' must be set to avoid an infinite loop");
         }
@@ -222,13 +223,6 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
      */
     static PollResult poll(
         RunContext runContext, DisClient client, String rStreamName, List<String> partitionIds,
-        Map<String, String> resumeFrom, PollConfig config, OutputStream out
-    ) throws Exception {
-        return poll(runContext, client, rStreamName, partitionIds, resumeFrom, config, out, new AtomicBoolean(true));
-    }
-
-    static PollResult poll(
-        RunContext runContext, DisClient client, String rStreamName, List<String> partitionIds,
         Map<String, String> resumeFrom, PollConfig config, OutputStream out, AtomicBoolean isActive
     ) throws Exception {
         var logger = runContext.logger();
@@ -247,10 +241,10 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
         var started = Instant.now();
         var finished = false;
 
-        while (!finished && (isActive == null || isActive.get())) {
+        while (!finished && isActive.get()) {
             var roundRecords = 0;
             for (var pid : partitionIds) {
-                if (isActive != null && !isActive.get()) {
+                if (!isActive.get()) {
                     break;
                 }
                 var cursor = cursors.get(pid);
@@ -284,7 +278,7 @@ public class Consume extends AbstractDis implements RunnableTask<Consume.Output>
             finished = (config.maxRecords() >= 0 && total >= config.maxRecords())
                 || (config.maxDuration() != null && Instant.now().isAfter(started.plus(config.maxDuration())))
                 || roundRecords == 0
-                || (isActive != null && !isActive.get());
+                || !isActive.get();
         }
 
         return new PollResult(total, lastSequenceNumbers);

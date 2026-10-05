@@ -134,10 +134,18 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
     @Getter(AccessLevel.NONE)
     @ToString.Exclude
     @EqualsAndHashCode.Exclude
+    private final AtomicBoolean isKilled = new AtomicBoolean(false);
+
+    @Builder.Default
+    @Getter(AccessLevel.NONE)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
     private final AtomicReference<KafkaConsumer<byte[], byte[]>> consumerRef = new AtomicReference<>();
 
     @Override
     public Output run(RunContext runContext) throws Exception {
+        this.isActive.set(true);
+        this.isKilled.set(false);
         if (maxRecords == null && maxDuration == null) {
             throw new IllegalArgumentException("'maxRecords' or 'maxDuration' must be set to avoid an infinite loop");
         }
@@ -190,7 +198,7 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
             }
 
             output.flush();
-            if (this.isActive.get()) {
+            if (!this.isKilled.get()) {
                 consumer.commitSync();
             }
         }
@@ -206,9 +214,14 @@ public class Consume extends AbstractDmsKafka implements RunnableTask<Consume.Ou
 
     @Override
     public void kill() {
+        this.isKilled.set(true);
         stop();
     }
 
+    /**
+     * Unlike DIS and RocketMQ which poll synchronously per request, KafkaConsumer poll() blocks on the network
+     * thread and requires wakeup() to be interrupted from another thread.
+     */
     @Override
     public void stop() {
         this.isActive.set(false);

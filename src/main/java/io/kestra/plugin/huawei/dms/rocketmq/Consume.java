@@ -92,6 +92,7 @@ public class Consume extends AbstractDmsRocketMq implements RunnableTask<Consume
 
     @Override
     public Output run(RunContext runContext) throws Exception {
+        this.isActive.set(true);
         if (maxRecords == null && maxDuration == null) {
             throw new IllegalArgumentException("'maxRecords' or 'maxDuration' must be set to avoid an infinite loop");
         }
@@ -134,12 +135,11 @@ public class Consume extends AbstractDmsRocketMq implements RunnableTask<Consume
                                 .bornTimestamp(msg.getBornTimestamp())
                                 .build());
                             total++;
+                            consumer.updateConsumeOffset(mq, msg.getQueueOffset() + 1);
                             if (isFinished(runContext, total, started) || !this.isActive.get()) {
-                                consumer.updateConsumeOffset(mq, pullResult.getNextBeginOffset());
                                 break outer;
                             }
                         }
-                        consumer.updateConsumeOffset(mq, pullResult.getNextBeginOffset());
                         offset = pullResult.getNextBeginOffset();
                     } else if (pullResult.getPullStatus() == PullStatus.NO_NEW_MSG ||
                         pullResult.getPullStatus() == PullStatus.NO_MATCHED_MSG) {

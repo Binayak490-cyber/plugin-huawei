@@ -154,7 +154,7 @@ public class Trigger extends AbstractDisTrigger
         var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
         Consume.PollResult result;
         try (var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE)) {
-            result = Consume.poll(runContext, client, rStreamName, partitionIds, watermark, config, output);
+            result = Consume.poll(runContext, client, rStreamName, partitionIds, watermark, config, output, new java.util.concurrent.atomic.AtomicBoolean(true));
             output.flush();
         }
 
